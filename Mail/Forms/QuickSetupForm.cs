@@ -6,11 +6,13 @@ namespace Mail.Forms
     public partial class QuickSetupForm : Form
     {
         private AccountService _accountService;
+        private MicrosoftOAuth2Service _oauthService;
 
         public QuickSetupForm(AccountService accountService)
         {
             InitializeComponent();
             _accountService = accountService;
+            _oauthService = new MicrosoftOAuth2Service();
             SetupForm();
         }
 
@@ -45,13 +47,21 @@ namespace Mail.Forms
                 detectedTypeLabel.Text = $"Detected: {detectedType}";
                 detectedTypeLabel.Visible = true;
 
-                // Show OAuth info for Outlook
+                // Show different setup options based on provider
                 if (domain.Contains("outlook") || domain.Contains("hotmail") || domain.Contains("live") || domain.Contains("msn"))
                 {
-                    oauthInfoLabel.Text = "Note: Outlook accounts use secure OAuth2 authentication. You'll be redirected to Microsoft's login page.";
+                    oauthInfoLabel.Text = "Note: Microsoft accounts require special authentication. Click 'Set Up' for guided setup.";
                     oauthInfoLabel.Visible = true;
                     passwordTextBox.Enabled = false;
-                    passwordLabel.Text = "Password: (OAuth2 - will be handled automatically)";
+                    passwordTextBox.Text = "";
+                    passwordLabel.Text = "Password: (Will be handled during setup)";
+                }
+                else if (domain.Contains("gmail") || domain.Contains("googlemail"))
+                {
+                    oauthInfoLabel.Text = "Note: Gmail requires an App Password for security. Use your Gmail App Password, not your regular password.";
+                    oauthInfoLabel.Visible = true;
+                    passwordTextBox.Enabled = true;
+                    passwordLabel.Text = "App Password: (Generate at myaccount.google.com/security)";
                 }
                 else
                 {
@@ -86,44 +96,85 @@ namespace Mail.Forms
                     DisplayName = displayNameTextBox.Text
                 };
 
-                // Apply quick setup
-                _accountService.ApplyQuickSetup(account, emailTextBox.Text, passwordTextBox.Text);
+                var domain = emailTextBox.Text.Split('@').LastOrDefault()?.ToLower();
+                var isMicrosoftAccount = domain?.Contains("outlook") == true || domain?.Contains("hotmail") == true || 
+                                       domain?.Contains("live") == true || domain?.Contains("msn") == true;
 
-                progressLabel.Text = "Testing connection...";
-                Application.DoEvents();
-
-                // Test the connection
-                var connectionSuccess = await _accountService.TestConnectionAsync(account);
-
-                if (connectionSuccess)
+                if (isMicrosoftAccount)
                 {
-                    _accountService.AddAccount(account);
-                    progressLabel.Text = "Account setup complete!";
-                    
-                    MessageBox.Show("Email account configured successfully!", "Setup Complete", 
-                        MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    
-                    this.DialogResult = DialogResult.OK;
-                    this.Close();
+                    // Handle Microsoft account setup
+                    progressLabel.Text = "Setting up Microsoft account...";
+                    Application.DoEvents();
+
+                    var success = await _oauthService.AuthenticateAsync(account);
+                    if (success)
+                    {
+                        // Test the connection
+                        progressLabel.Text = "Testing connection...";
+                        var connectionSuccess = await _accountService.TestConnectionAsync(account);
+                        
+                        if (connectionSuccess)
+                        {
+                            _accountService.AddAccount(account);
+                            progressLabel.Text = "Microsoft account setup complete!";
+                            
+                            MessageBox.Show("Microsoft account configured successfully!", "Setup Complete", 
+                                MessageBoxButtons.OK, MessageBoxIcon.Information);
+                            
+                            this.DialogResult = DialogResult.OK;
+                            this.Close();
+                        }
+                        else
+                        {
+                            progressLabel.Text = "Connection failed.";
+                            MessageBox.Show("Account configured but connection test failed. Please check your credentials.", 
+                                "Connection Failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        }
+                    }
+                    else
+                    {
+                        progressLabel.Text = "Setup cancelled.";
+                    }
                 }
                 else
                 {
-                    progressLabel.Text = "Connection failed. Please check your settings.";
-                    
-                    var result = MessageBox.Show(
-                        "Could not connect to the email server. Would you like to configure advanced settings manually?",
-                        "Connection Failed",
-                        MessageBoxButtons.YesNo,
-                        MessageBoxIcon.Warning);
+                    // Handle regular IMAP/SMTP setup
+                    _accountService.ApplyQuickSetup(account, emailTextBox.Text, passwordTextBox.Text);
 
-                    if (result == DialogResult.Yes)
+                    progressLabel.Text = "Testing connection...";
+                    Application.DoEvents();
+
+                    var connectionSuccess = await _accountService.TestConnectionAsync(account);
+
+                    if (connectionSuccess)
                     {
-                        // Open advanced account form
-                        var accountForm = new AccountForm(_accountService, account);
-                        if (accountForm.ShowDialog() == DialogResult.OK)
+                        _accountService.AddAccount(account);
+                        progressLabel.Text = "Account setup complete!";
+                        
+                        MessageBox.Show("Email account configured successfully!", "Setup Complete", 
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        
+                        this.DialogResult = DialogResult.OK;
+                        this.Close();
+                    }
+                    else
+                    {
+                        progressLabel.Text = "Connection failed. Please check your settings.";
+                        
+                        var result = MessageBox.Show(
+                            "Could not connect to the email server. Would you like to configure advanced settings manually?",
+                            "Connection Failed",
+                            MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Warning);
+
+                        if (result == DialogResult.Yes)
                         {
-                            this.DialogResult = DialogResult.OK;
-                            this.Close();
+                            var accountForm = new AccountForm(_accountService, account);
+                            if (accountForm.ShowDialog() == DialogResult.OK)
+                            {
+                                this.DialogResult = DialogResult.OK;
+                                this.Close();
+                            }
                         }
                     }
                 }
@@ -183,12 +234,13 @@ namespace Mail.Forms
                 return false;
             }
 
-            // For non-OAuth accounts, password is required
+            // Check if password is needed
             var domain = emailTextBox.Text.Split('@').LastOrDefault()?.ToLower();
-            var isOAuth = domain?.Contains("outlook") == true || domain?.Contains("hotmail") == true || 
-                         domain?.Contains("live") == true || domain?.Contains("msn") == true;
+            var isMicrosoftAccount = domain?.Contains("outlook") == true || domain?.Contains("hotmail") == true || 
+                                   domain?.Contains("live") == true || domain?.Contains("msn") == true;
 
-            if (!isOAuth && string.IsNullOrWhiteSpace(passwordTextBox.Text))
+            // For non-Microsoft accounts, password is required
+            if (!isMicrosoftAccount && string.IsNullOrWhiteSpace(passwordTextBox.Text))
             {
                 MessageBox.Show("Please enter your password.", "Validation Error", 
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);

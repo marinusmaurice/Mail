@@ -43,6 +43,7 @@ namespace Mail
             // Subscribe to events
             _emailService.NewEmailReceived += OnNewEmailReceived;
             _emailService.EmailSent += OnEmailSent;
+            _emailService.SyncProgressChanged += OnSyncProgressChanged;
         }
 
         private void SetupOutlookInterface()
@@ -121,20 +122,35 @@ namespace Mail
                 else
                 {
                     LoadInboxEmails();
-                    // Start receiving emails in the background
+                    // Start receiving emails in the background with better error handling
                     Task.Run(async () =>
                     {
                         try
                         {
+                            // Small delay to let the UI settle
+                            await Task.Delay(1000);
+                            
                             await _emailService.RefreshEmailsAsync();
                             if (this.IsHandleCreated && !this.IsDisposed)
                             {
-                                this.Invoke(() => LoadInboxEmails());
+                                this.Invoke(() => 
+                                {
+                                    LoadInboxEmails();
+                                    UpdateFolderCounts();
+                                });
                             }
                         }
-                        catch
+                        catch (Exception ex)
                         {
-                            // Ignore errors during background refresh
+                            if (this.IsHandleCreated && !this.IsDisposed)
+                            {
+                                this.Invoke(() =>
+                                {
+                                    if (statusLabel != null)
+                                        statusLabel.Text = "Background sync failed - check account settings";
+                                });
+                            }
+                            System.Diagnostics.Debug.WriteLine($"Background sync failed: {ex.Message}");
                         }
                     });
                 }
@@ -281,6 +297,27 @@ namespace Mail
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"Error updating email list: {ex.Message}");
+            }
+        }
+
+        private void OnSyncProgressChanged(object? sender, string message)
+        {
+            try
+            {
+                if (this.IsHandleCreated && !this.IsDisposed)
+                {
+                    this.Invoke(() =>
+                    {
+                        if (statusLabel != null)
+                        {
+                            statusLabel.Text = message;
+                        }
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Error updating sync progress: {ex.Message}");
             }
         }
 
@@ -604,7 +641,14 @@ namespace Mail
                 return;
             }
 
-            if (statusLabel != null) statusLabel.Text = "Sending and receiving emails...";
+            if (statusLabel != null) statusLabel.Text = "Starting synchronization...";
+            
+            // Disable sync button during operation if it exists
+            var syncButton = mainMenuStrip?.Items.OfType<ToolStripMenuItem>()
+                .FirstOrDefault(item => item.Text.Contains("Tools"))?.DropDownItems
+                .OfType<ToolStripMenuItem>().FirstOrDefault(item => item.Text.Contains("Send/Receive"));
+            
+            if (syncButton != null) syncButton.Enabled = false;
             
             Task.Run(async () =>
             {
@@ -616,10 +660,14 @@ namespace Mail
                         this.Invoke(() =>
                         {
                             if (statusLabel != null) statusLabel.Text = "Ready";
+                            if (syncButton != null) syncButton.Enabled = true;
                             LoadInboxEmails();
                             UpdateFolderCounts();
-                            MessageBox.Show("Send/Receive completed successfully!", "Mail", 
-                                MessageBoxButtons.OK, MessageBoxIcon.Information);
+                            
+                            // Show success message with details
+                            var inboxCount = _emailService.GetEmails(EmailFolder.Inbox).Count;
+                            MessageBox.Show($"Synchronization completed successfully!\n\nInbox: {inboxCount} emails", 
+                                "Sync Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
                         });
                     }
                 }
@@ -629,9 +677,12 @@ namespace Mail
                     {
                         this.Invoke(() =>
                         {
-                            if (statusLabel != null) statusLabel.Text = "Ready";
-                            MessageBox.Show($"Send/Receive failed: {ex.Message}", "Mail Error", 
-                                MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            if (statusLabel != null) statusLabel.Text = "Sync failed";
+                            if (syncButton != null) syncButton.Enabled = true;
+                            
+                            var errorMsg = ex.Message.Length > 200 ? ex.Message.Substring(0, 200) + "..." : ex.Message;
+                            MessageBox.Show($"Synchronization failed:\n\n{errorMsg}\n\nPlease check your account settings and internet connection.", 
+                                "Sync Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                         });
                     }
                 }

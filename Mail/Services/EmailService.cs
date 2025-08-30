@@ -13,6 +13,8 @@ namespace Mail.Services
         private IEmailProvider? _currentProvider;
         private int _nextId = 1;
 
+        // Progress tracking
+        public event EventHandler<string>? SyncProgressChanged;
         public event EventHandler<EmailMessage>? NewEmailReceived;
         public event EventHandler<EmailMessage>? EmailSent;
         public event EventHandler<EmailMessage>? EmailDeleted;
@@ -49,6 +51,7 @@ namespace Mail.Services
                     throw new InvalidOperationException("No default email account configured. Please set up an email account first.");
                 }
 
+                SyncProgressChanged?.Invoke(this, "Sending email...");
                 var provider = GetEmailProvider(account);
                 var success = await provider.SendEmailAsync(account, email);
 
@@ -60,12 +63,14 @@ namespace Mail.Services
                     email.From = account.EmailAddress;
                     _emails.Add(email);
                     EmailSent?.Invoke(this, email);
+                    SyncProgressChanged?.Invoke(this, "Email sent successfully");
                 }
 
                 return success;
             }
             catch (Exception ex)
             {
+                SyncProgressChanged?.Invoke(this, $"Failed to send email: {ex.Message}");
                 throw new Exception($"Failed to send email: {ex.Message}", ex);
             }
         }
@@ -88,7 +93,7 @@ namespace Mail.Services
             });
         }
 
-        public async Task<List<EmailMessage>> ReceiveEmailsAsync(EmailFolder folder = EmailFolder.Inbox)
+        public async Task<List<EmailMessage>> ReceiveEmailsAsync(EmailFolder folder = EmailFolder.Inbox, bool showProgress = true)
         {
             try
             {
@@ -99,32 +104,75 @@ namespace Mail.Services
                     return GetEmails(folder);
                 }
 
-                var provider = GetEmailProvider(account);
-                var receivedEmails = await provider.ReceiveEmailsAsync(account, folder);
+                if (showProgress)
+                    SyncProgressChanged?.Invoke(this, $"Connecting to {account.IncomingServer.Server}...");
 
-                // Update local storage
+                var provider = GetEmailProvider(account);
+                
+                // Retry logic
+                List<EmailMessage> receivedEmails = new List<EmailMessage>();
+                var maxRetries = 3;
+                var retryCount = 0;
+                
+                while (retryCount < maxRetries)
+                {
+                    try
+                    {
+                        if (showProgress)
+                            SyncProgressChanged?.Invoke(this, $"Fetching emails from {folder}...");
+                        
+                        receivedEmails = await provider.ReceiveEmailsAsync(account, folder);
+                        break; // Success, exit retry loop
+                    }
+                    catch (Exception ex) when (retryCount < maxRetries - 1)
+                    {
+                        retryCount++;
+                        if (showProgress)
+                            SyncProgressChanged?.Invoke(this, $"Retry {retryCount}/{maxRetries}: {ex.Message}");
+                        await Task.Delay(2000 * retryCount); // Exponential backoff
+                    }
+                }
+
+                if (showProgress)
+                    SyncProgressChanged?.Invoke(this, $"Processing {receivedEmails.Count} emails...");
+
+                // Update local storage with improved duplicate detection
+                var newEmailsCount = 0;
                 foreach (var email in receivedEmails)
                 {
-                    var existing = _emails.FirstOrDefault(e => e.Subject == email.Subject && 
-                                                               e.From == email.From && 
-                                                               e.DateReceived == email.DateReceived);
+                    var existing = _emails.FirstOrDefault(e => 
+                        IsDuplicate(e, email));
+                    
                     if (existing == null)
                     {
                         email.Id = _nextId++;
                         _emails.Add(email);
+                        newEmailsCount++;
                         
                         if (folder == EmailFolder.Inbox && !email.IsRead)
                         {
                             NewEmailReceived?.Invoke(this, email);
                         }
                     }
+                    else
+                    {
+                        // Update existing email with potentially newer information
+                        existing.IsRead = email.IsRead;
+                        existing.IsImportant = email.IsImportant;
+                        existing.IsFlagged = email.IsFlagged;
+                    }
                 }
+
+                if (showProgress)
+                    SyncProgressChanged?.Invoke(this, $"Sync complete: {newEmailsCount} new emails added");
 
                 return GetEmails(folder);
             }
             catch (Exception ex)
             {
-                throw new Exception($"Failed to receive emails: {ex.Message}", ex);
+                var errorMsg = $"Failed to receive emails from {folder}: {ex.Message}";
+                SyncProgressChanged?.Invoke(this, errorMsg);
+                throw new Exception(errorMsg, ex);
             }
         }
 
@@ -132,11 +180,15 @@ namespace Mail.Services
         {
             try
             {
+                SyncProgressChanged?.Invoke(this, "Testing connection...");
                 var provider = GetEmailProvider(account);
-                return await provider.TestConnectionAsync(account);
+                var result = await provider.TestConnectionAsync(account);
+                SyncProgressChanged?.Invoke(this, result ? "Connection successful" : "Connection failed");
+                return result;
             }
-            catch
+            catch (Exception ex)
             {
+                SyncProgressChanged?.Invoke(this, $"Connection test failed: {ex.Message}");
                 return false;
             }
         }
@@ -196,14 +248,33 @@ namespace Mail.Services
         {
             try
             {
-                // Refresh all folders
-                await ReceiveEmailsAsync(EmailFolder.Inbox);
-                await ReceiveEmailsAsync(EmailFolder.SentItems);
-                await ReceiveEmailsAsync(EmailFolder.Drafts);
+                SyncProgressChanged?.Invoke(this, "Starting email synchronization...");
+                
+                // Refresh all folders sequentially to avoid overwhelming the server
+                var folders = new[] { EmailFolder.Inbox, EmailFolder.SentItems, EmailFolder.Drafts };
+                
+                foreach (var folder in folders)
+                {
+                    try
+                    {
+                        await ReceiveEmailsAsync(folder, true);
+                        // Small delay between folders to be gentle on the server
+                        await Task.Delay(500);
+                    }
+                    catch (Exception ex)
+                    {
+                        SyncProgressChanged?.Invoke(this, $"Warning: Failed to sync {folder}: {ex.Message}");
+                        // Continue with other folders even if one fails
+                    }
+                }
+                
+                SyncProgressChanged?.Invoke(this, "Email synchronization completed");
             }
             catch (Exception ex)
             {
-                throw new Exception($"Failed to refresh emails: {ex.Message}", ex);
+                var errorMsg = $"Failed to refresh emails: {ex.Message}";
+                SyncProgressChanged?.Invoke(this, errorMsg);
+                throw new Exception(errorMsg, ex);
             }
         }
 
@@ -232,36 +303,34 @@ namespace Mail.Services
             };
         }
 
+        private bool IsDuplicate(EmailMessage existing, EmailMessage newEmail)
+        {
+            // More sophisticated duplicate detection
+            return existing.Subject == newEmail.Subject &&
+                   existing.From == newEmail.From &&
+                   Math.Abs((existing.DateReceived - newEmail.DateReceived).TotalSeconds) < 60; // Within 1 minute
+        }
+
         private void InitializeSampleData()
         {
-            // Add some sample emails only if no accounts are configured
+            // Only add sample emails if NO accounts are configured
+            // Once real accounts are set up, we should rely on real email sync
             var accounts = _accountService.GetAllAccounts();
             if (!accounts.Any())
             {
                 _emails.Add(new EmailMessage
                 {
                     Id = _nextId++,
-                    From = "john.doe@company.com",
-                    To = "me@outlook.com",
-                    Subject = "Welcome to Your New Email Client",
-                    Body = "Hi there!\n\nWelcome to your new Outlook-compatible email client. To get started:\n\n1. Go to File > Settings to add your email account\n2. Configure your Outlook, Gmail, or other email account\n3. Start sending and receiving real emails!\n\nBest regards,\nThe Email Team",
-                    DateReceived = DateTime.Now.AddHours(-1),
+                    From = "setup@emailclient.local",
+                    To = "user@localhost",
+                    Subject = "Welcome - Please Set Up Your Email Account",
+                    Body = "Welcome to your email client!\n\nTo start receiving real emails:\n\n1. Go to File ? Add Account\n2. Enter your email provider settings (Gmail, Yahoo, Outlook, etc.)\n3. Use real IMAP/SMTP servers to sync your actual emails\n\nThis welcome message will disappear once you configure a real email account.",
+                    DateReceived = DateTime.Now.AddMinutes(-5),
                     IsRead = false,
                     Folder = EmailFolder.Inbox
                 });
-
-                _emails.Add(new EmailMessage
-                {
-                    Id = _nextId++,
-                    From = "support@emailclient.com",
-                    To = "me@outlook.com",
-                    Subject = "Getting Started Guide",
-                    Body = "Here's how to configure your email accounts:\n\nFor Outlook/Exchange:\n- Account Type: Outlook\n- Authentication: OAuth2 (recommended)\n\nFor Gmail:\n- Account Type: IMAP\n- Incoming Server: imap.gmail.com (Port 993, SSL)\n- Outgoing Server: smtp.gmail.com (Port 587, STARTTLS)\n\nFor other providers, check their documentation for IMAP/SMTP settings.",
-                    DateReceived = DateTime.Now.AddHours(-2),
-                    IsRead = true,
-                    Folder = EmailFolder.Inbox
-                });
             }
+            // DO NOT add sample data if accounts exist - use real emails only!
         }
     }
 }
